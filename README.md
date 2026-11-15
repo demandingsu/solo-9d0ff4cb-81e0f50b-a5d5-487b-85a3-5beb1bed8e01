@@ -5,6 +5,7 @@
 
 - **采集端（collector）**：FastAPI + SQLite，通过 HTTP Range 增量拉取、
   四行 FASTQ 校验、按名称配对、字节级断点续采，全部配对完成后可下载 R1/R2；
+  另提供**两运行读段内容重合比对**（后台任务），用于排查重复投递；
 - **仪器中转站（relay）**：本地模拟服务，支持 HTTP Range、分段追加、
   单端（R2）延迟写入、完成标志 `DONE` 与可控制的连接中断窗口；
 - **一键演示（demo）**：自动建场景（含中断）、反复触发采集、下载并逐字节校验。
@@ -14,9 +15,10 @@
 ```
 .
 ├── collector/            # 采集端
-│   ├── app.py            # REST API（采集/进度/下载/健康检查）
+│   ├── app.py            # REST API（采集/进度/下载/重合比对/健康检查）
 │   ├── service.py        # Range 续采 + 配对状态机 + 终态校验
 │   ├── parser.py         # 字节级 FASTQ 解析与结构校验
+│   ├── compare.py        # 两运行读段内容重合比对（后台任务、快照一致）
 │   └── db.py             # SQLite 模式与单事务配对提交
 ├── relay/                # 模拟仪器中转站
 │   └── app.py            # Range 文件服务 + 追加写线程 + 中断控制
@@ -75,7 +77,12 @@ curl -OJ http://localhost:8000/collect/runs/runA/R2
 | GET | `/collect/runs` | 列出全部运行 |
 | GET | `/collect/runs/{id}` | 查询状态、两端字节进度、配对数、错误详情 |
 | GET | `/collect/runs/{id}/R1` `/R2` | 下载已配对 FASTQ，**仅 `completed` 允许**，否则 409 |
+| POST | `/compare/jobs` | 提交两运行读段内容重合比对（202，后台执行），body：`{"run_a","run_b"}` |
+| GET | `/compare/jobs` | 列出比对任务（仅内存，重启清空） |
+| GET | `/compare/jobs/{job_id}` | 查询比对任务状态与结果 |
 | GET | `/healthz` | 存活探针 |
+
+以上端点均可在 `http://localhost:8000/docs`（Swagger UI）中直接操作。
 
 进度响应示例：
 
@@ -94,6 +101,41 @@ curl -OJ http://localhost:8000/collect/runs/runA/R2
 
 状态取值：`running`（采集中/等待追加）、`completed`（全部配对）、
 `error`（结构错误、名称不匹配、完成后残条或孤读）。
+
+### 重合比对（排查重复投递）
+
+怀疑两个运行的 FASTQ 被重复投递时，提交一次比对任务：
+
+```bash
+curl -X POST http://localhost:8000/compare/jobs -H 'content-type: application/json' \
+  -d '{"run_a": "runA", "run_b": "runB"}'     # 202 -> {"job_id": "...", "status": "pending"}
+curl http://localhost:8000/compare/jobs/<job_id>   # 轮询直到 status=done
+```
+
+规则与结果：
+
+- **分组规则**：忽略读段名，仅当 R1、R2 的序列与质量串四条字节串分别
+  逐字节相同时视为同组（工程上以带长度前缀的 128-bit SHA-256 摘要为
+  分组键，碰撞概率可忽略）；
+- **重合对数**：同组在两边各出现 `c_a`、`c_b` 次时，按 `min(c_a, c_b)`
+  计入，逐组求和即 `overlap_pairs`；
+- **结果内容**：两运行各自的状态与已提交对数、`overlap_pairs`、
+  重合组数 `overlap_groups`，以及最多 10 个样例分组——每组给出两边
+  出现次数、双方配对序号（每侧最多 32 个，超出置 `truncated_*`）和
+  一段序列预览，供人工复核；
+- **快照一致**：两个运行的状态、计数与样例全部来自同一个 SQLite 已提交
+  快照（单只读事务，WAL 模式下不阻塞采集写事务）；运行仍在采集时，
+  结果反映比对开始时的已提交进度，之后新配对不计入本次；
+- **大运行友好**：配对流式读取，分组键写入独立临时 SQLite 库
+  （默认位于数据库目录下 `compare-tmp/`），任何时刻内存只持有一个
+  批次，不会整份载入内存；
+- **不阻塞采集**：比对在独立后台线程执行（并发数见
+  `COLLECTOR_COMPARE_WORKERS`），超出的任务排队；
+- **失败安全**：主库连接置 `query_only`，从机制上无法写主库；任务失败
+  只记录到任务本身（`status=failed` + `error`），原始读段与采集进度
+  不受影响，临时目录即删。
+
+任务记录保存在内存中（进程重启即清空，最多保留最近 200 条）。
 
 ### 中转站 `:8001`
 
@@ -141,10 +183,12 @@ pip install -r requirements-dev.txt
 python -m pytest tests/ -q
 ```
 
-测试包含 16 个用例：解析器偏移/残行/结构校验单元测试，以及真实
+测试包含 27 个用例：解析器偏移/残行/结构校验单元测试，真实
 uvicorn 子进程下的端到端集成测试——增量配对、R2 滞后、连接中断续采、
 **采集进程重启后从 SQLite 断点恢复**、名称不匹配/结构错误/残条/孤读
-的错误终态与两端位置回报、Range 206/416、下载门控等。
+的错误终态与两端位置回报、Range 206/416、下载门控，以及重合比对的
+分组键单元测试、min 计数与样例序号、采集中快照一致性、失败不改数据
+与临时目录清理。
 
 ## 环境变量
 
@@ -152,5 +196,6 @@ uvicorn 子进程下的端到端集成测试——增量配对、R2 滞后、连
 | --- | --- | --- | --- |
 | `COLLECTOR_DB` | collector | `/data/collector/collector.db` | SQLite 文件路径 |
 | `COLLECTOR_TIMEOUT` | collector | `10` | 单次 HTTP 超时秒数 |
+| `COLLECTOR_COMPARE_WORKERS` | collector | `2` | 重合比对后台线程并发数 |
 | `RELAY_DATA` | relay | `/data/relay` | 运行目录根路径 |
 | `RELAY_URL` / `COLLECTOR_URL` / `RUN_ID` | demo | 见 `scripts/demo.py` | 演示目标 |

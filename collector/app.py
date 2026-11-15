@@ -6,6 +6,9 @@
 * GET  /collect/runs/{id}       查询单次运行进度与错误详情
 * GET  /collect/runs/{id}/R1    下载已配对的 R1（仅 completed 允许）
 * GET  /collect/runs/{id}/R2    下载已配对的 R2（仅 completed 允许）
+* POST /compare/jobs            提交两个运行的读段内容重合比对（后台执行）
+* GET  /compare/jobs            列出比对任务
+* GET  /compare/jobs/{job_id}   查询比对任务状态与结果
 * GET  /healthz                 存活探针
 """
 from __future__ import annotations
@@ -20,14 +23,17 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from . import db
+from .compare import CompareManager
 from .service import CollectorService
 
 DB_PATH = os.environ.get("COLLECTOR_DB", "/data/collector.db")
 HTTP_TIMEOUT = float(os.environ.get("COLLECTOR_TIMEOUT", "10"))
+COMPARE_WORKERS = int(os.environ.get("COLLECTOR_COMPARE_WORKERS", "2"))
 
 _conn = db.connect(DB_PATH)
 db.init_db(_conn)
 _service = CollectorService(_conn, timeout=HTTP_TIMEOUT)
+_compare = CompareManager(DB_PATH, max_workers=COMPARE_WORKERS)
 
 
 @asynccontextmanager
@@ -42,6 +48,13 @@ app = FastAPI(title="双端 FASTQ 增量采集服务", version="1.0.0", lifespan
 class CollectRequest(BaseModel):
     run_id: str = Field(..., min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.-]+$")
     base_url: str = Field(..., min_length=1, description="运行目录 URL，如 http://relay:8000/runs/demo")
+
+
+class CompareRequest(BaseModel):
+    run_a: str = Field(..., min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.-]+$",
+                       description="第一个运行号")
+    run_b: str = Field(..., min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.-]+$",
+                       description="第二个运行号（须与 run_a 不同）")
 
 
 @app.get("/healthz")
@@ -108,3 +121,33 @@ def download(run_id: str, side: int):
         media_type="text/plain; charset=utf-8",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+
+
+# ------------------------------------------------------------------ 重合比对
+@app.post("/compare/jobs", status_code=202)
+def create_compare_job(req: CompareRequest):
+    """提交两个运行的读段内容重合比对。
+
+    忽略读段名，仅按 R1/R2 的序列与质量串逐字节分组；比对在后台线程
+    执行（不阻塞采集），通过 GET /compare/jobs/{job_id} 轮询结果。
+    """
+    if req.run_a == req.run_b:
+        raise HTTPException(status_code=422, detail="run_a 与 run_b 不能相同")
+    missing = [rid for rid in (req.run_a, req.run_b) if db.get_run(_conn, rid) is None]
+    if missing:
+        raise HTTPException(status_code=404, detail=f"运行不存在: {', '.join(missing)}")
+    job = _compare.submit(req.run_a, req.run_b)
+    return job.public()
+
+
+@app.get("/compare/jobs")
+def list_compare_jobs():
+    return {"jobs": [j.public() for j in _compare.list()]}
+
+
+@app.get("/compare/jobs/{job_id}")
+def get_compare_job(job_id: str):
+    job = _compare.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"比对任务 {job_id} 不存在")
+    return job.public()
